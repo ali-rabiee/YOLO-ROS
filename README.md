@@ -1,6 +1,3 @@
-Here’s a comprehensive `README.md` for your ROS package `yolo-ros`:
-
-```markdown
 # YOLO-ROS: Object Detection and Gripper Control Integration
 
 This ROS package integrates YOLO object detection with a robotic arm control system, utilizing Kinova gripper finger positions and head position feedback for automating grasp and release actions. The detected objects are processed and published along with segmentation masks and image annotations.
@@ -114,10 +111,3 @@ If you need to adjust the criteria for triggering grasp/release actions, modify 
 ## Contributing
 
 Contributions are welcome! Please submit a pull request or create an issue if you encounter any bugs or want to propose new features.
-
-## License
-
-This project is licensed under the MIT License.
-```
-
-This `README.md` covers the setup, node architecture, usage instructions, and customization options for the `yolo-ros` package.
