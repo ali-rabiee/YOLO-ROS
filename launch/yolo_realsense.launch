@@ -1,0 +1,24 @@
+<launch>
+  <!-- Model switching:
+       roslaunch yolo-ros yolo_realsense.launch model_variant:=yolo26
+       roslaunch yolo-ros yolo_realsense.launch model_variant:=yolov8
+
+       Optional:
+       model_path:=/abs/path/to/weights.pt
+  -->
+  <arg name="model_variant" default="yolo26"/>
+  <arg name="model_path" default=""/>
+  <arg name="publish_segmentation_masks" default="true"/>
+  <arg name="mask_publish_mode" default="always"/>
+  <arg name="image_topic" default="/camera/color/image_raw"/>
+
+  <include file="$(find realsense2_camera)/launch/rs_camera.launch"/>
+  <node pkg="yolo-ros" type="yolo_node.py" name="yolo_node" output="screen">
+    <param name="model_variant" value="$(arg model_variant)"/>
+    <!-- Only set model_path if non-empty; otherwise node picks a default -->
+    <param if="$(eval arg('model_path') != '')" name="model_path" value="$(arg model_path)"/>
+    <param name="publish_segmentation_masks" value="$(arg publish_segmentation_masks)"/>
+    <param name="mask_publish_mode" value="$(arg mask_publish_mode)"/>
+    <param name="image_topic" value="$(arg image_topic)"/>
+  </node>
+</launch>
