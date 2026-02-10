@@ -73,6 +73,24 @@ class YoloRosNode:
         self.mask_publish_key = str(rospy.get_param("~mask_publish_key", "mask")).strip().lower()
 
         # -----------------------
+        # Mask-based yaw estimation (purely image-based)
+        # -----------------------
+        # If enabled and masks are available, compute an in-image yaw for each detected instance
+        # from the principal axis of its segmentation mask (PCA on mask pixels) and attach it
+        # into /yolo/detections_json as:
+        #   det["mask_center_xy"] = [cx, cy]
+        #   det["mask_yaw_rad"]   = yaw  (radians, image coords; +x right, +y down)
+        #   det["mask_yaw_ratio"] = major/minor axis ratio (bigger = more elongated)
+        #
+        # Downstream (PRIME) can map this yaw into robot/world yaw with simple flips/offset.
+        self.compute_mask_yaw = bool(rospy.get_param("~compute_mask_yaw", True))
+        self.mask_yaw_min_pixels = int(rospy.get_param("~mask_yaw_min_pixels", 80))
+        self.mask_yaw_min_ratio = float(rospy.get_param("~mask_yaw_min_ratio", 1.25))
+        # Debug overlay: draw the mask principal axis on /yolo/image_with_grid
+        self.draw_mask_yaw_overlay = bool(rospy.get_param("~draw_mask_yaw_overlay", True))
+        self.mask_yaw_overlay_len_px = int(rospy.get_param("~mask_yaw_overlay_len_px", 60))
+
+        # -----------------------
         # Image input topic
         # -----------------------
         # If you see cv_bridge errors like:
@@ -237,6 +255,14 @@ class YoloRosNode:
         if ws_bbox_xyxy is None:
             return None, None, None
         x1, y1, x2, y2 = ws_bbox_xyxy
+        # If outside bbox, it's not on the workspace/grid.
+        try:
+            fx = float(cx)
+            fy = float(cy)
+        except Exception:
+            return None, None, None
+        if fx < float(x1) or fx > float(x2) or fy < float(y1) or fy > float(y2):
+            return None, None, None
         w = max(1.0, float(x2 - x1))
         h = max(1.0, float(y2 - y1))
         col = int((float(cx) - x1) / (w / 3.0))
@@ -655,6 +681,51 @@ class YoloRosNode:
 
                 resized_mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
                 combined_mask_2d[resized_mask > 0] = class_id
+
+                # Attach per-instance mask yaw into JSON detections (if enabled).
+                # This is purely image-based and is used by PRIME to implement ALIGN_YAW.
+                if self.compute_mask_yaw and i < len(detections) and class_name == "object":
+                    try:
+                        ys, xs = np.nonzero(resized_mask > 0)
+                        n = int(xs.size)
+                        if n >= self.mask_yaw_min_pixels:
+                            x_mean = float(xs.mean())
+                            y_mean = float(ys.mean())
+                            x0 = xs.astype(np.float32) - x_mean
+                            y0 = ys.astype(np.float32) - y_mean
+                            # 2x2 covariance
+                            cxx = float(np.mean(x0 * x0))
+                            cyy = float(np.mean(y0 * y0))
+                            cxy = float(np.mean(x0 * y0))
+                            cov = np.array([[cxx, cxy], [cxy, cyy]], dtype=np.float32)
+                            eigvals, eigvecs = np.linalg.eigh(cov)  # ascending
+                            # principal axis = eigenvector with largest eigenvalue
+                            v = eigvecs[:, int(np.argmax(eigvals))]
+                            vx, vy = float(v[0]), float(v[1])
+                            yaw = float(np.arctan2(vy, vx))  # image coords
+                            # elongation ratio (stability heuristic)
+                            ev_min = float(max(1e-9, np.min(eigvals)))
+                            ev_max = float(max(1e-9, np.max(eigvals)))
+                            ratio = float(ev_max / ev_min)
+                            if ratio >= float(self.mask_yaw_min_ratio):
+                                detections[i]["mask_center_xy"] = [int(round(x_mean)), int(round(y_mean))]
+                                detections[i]["mask_yaw_rad"] = yaw
+                                detections[i]["mask_yaw_ratio"] = ratio
+
+                                # Optional debug overlay: draw principal axis on the grid image.
+                                if self.draw_mask_yaw_overlay:
+                                    cx_i = int(round(x_mean))
+                                    cy_i = int(round(y_mean))
+                                    L = int(max(10, self.mask_yaw_overlay_len_px))
+                                    dx = int(round(L * float(np.cos(yaw))))
+                                    dy = int(round(L * float(np.sin(yaw))))
+                                    p1 = (int(cx_i - dx), int(cy_i - dy))
+                                    p2 = (int(cx_i + dx), int(cy_i + dy))
+                                    cv2.line(image_with_grid, p1, p2, (0, 255, 255), 2)
+                                    cv2.circle(image_with_grid, (cx_i, cy_i), 3, (0, 255, 255), -1)
+                    except Exception:
+                        # Never break detection publishing due to yaw estimation
+                        pass
 
             combined_mask_2d_visual = np.zeros((height, width, 3), dtype=np.uint8)
             for class_id, color in self.color_map.items():
