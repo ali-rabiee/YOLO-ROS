@@ -684,7 +684,8 @@ class YoloRosNode:
 
                 # Attach per-instance mask yaw into JSON detections (if enabled).
                 # This is purely image-based and is used by PRIME to implement ALIGN_YAW.
-                if self.compute_mask_yaw and i < len(detections) and class_name == "object":
+                # Compute for ALL non-ignored classes (not just "object").
+                if self.compute_mask_yaw and i < len(detections) and class_name not in ("workspace", "jaco"):
                     try:
                         ys, xs = np.nonzero(resized_mask > 0)
                         n = int(xs.size)
