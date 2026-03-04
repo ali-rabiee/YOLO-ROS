@@ -62,7 +62,6 @@ class YoloRosNode:
         self.iou_threshold = float(rospy.get_param("~iou_threshold", 0.45))
         self.agnostic_nms = bool(rospy.get_param("~agnostic_nms", False))
         self.max_det = int(rospy.get_param("~max_det", 100))
-        self.duplicate_iou_threshold = float(rospy.get_param("~duplicate_iou_threshold", 0.80))
 
         # -----------------------
         # Segmentation masks
@@ -237,35 +236,30 @@ class YoloRosNode:
         iou = float(rospy.get_param("~iou_threshold", self.iou_threshold))
         agnostic = bool(rospy.get_param("~agnostic_nms", self.agnostic_nms))
         max_det = int(rospy.get_param("~max_det", self.max_det))
-        dup_iou = float(rospy.get_param("~duplicate_iou_threshold", self.duplicate_iou_threshold))
         conf = max(0.0, min(1.0, conf))
         iou = max(0.0, min(1.0, iou))
         max_det = max(1, max_det)
-        dup_iou = max(0.0, min(1.0, dup_iou))
         if (
             abs(conf - self.conf_threshold) > 1e-6
             or abs(iou - self.iou_threshold) > 1e-6
             or agnostic != self.agnostic_nms
             or max_det != self.max_det
-            or abs(dup_iou - self.duplicate_iou_threshold) > 1e-6
         ):
             rospy.loginfo(
-                "Updated YOLO params: conf=%.2f iou=%.2f agnostic_nms=%s max_det=%d duplicate_iou=%.2f",
+                "Updated YOLO params: conf=%.2f iou=%.2f agnostic_nms=%s max_det=%d",
                 conf,
                 iou,
                 str(agnostic),
                 max_det,
-                dup_iou,
             )
             self.conf_threshold = conf
             self.iou_threshold = iou
             self.agnostic_nms = agnostic
             self.max_det = max_det
-            self.duplicate_iou_threshold = dup_iou
 
     def _run_inference(self, cv_image):
         try:
-            return self.model(
+            results = self.model(
                 cv_image,
                 verbose=False,
                 conf=self.conf_threshold,
@@ -274,67 +268,79 @@ class YoloRosNode:
                 max_det=self.max_det,
             )
         except TypeError:
-            # Backward compatibility with older ultralytics versions.
-            return self.model(cv_image, verbose=False)
+            results = self.model(cv_image, verbose=False)
+        if results:
+            results[0] = self._dedup_boxes(results[0])
+        return results
 
     @staticmethod
-    def _bbox_iou_xyxy(a, b):
+    def _box_iou(a, b):
         ax1, ay1, ax2, ay2 = a
         bx1, by1, bx2, by2 = b
-        inter_x1 = max(ax1, bx1)
-        inter_y1 = max(ay1, by1)
-        inter_x2 = min(ax2, bx2)
-        inter_y2 = min(ay2, by2)
-        iw = max(0, inter_x2 - inter_x1)
-        ih = max(0, inter_y2 - inter_y1)
-        inter = float(iw * ih)
-        if inter <= 0.0:
-            return 0.0
-        area_a = float(max(0, ax2 - ax1) * max(0, ay2 - ay1))
-        area_b = float(max(0, bx2 - bx1) * max(0, by2 - by1))
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
         union = area_a + area_b - inter
-        if union <= 0.0:
-            return 0.0
-        return inter / union
+        return inter / union if union > 0 else 0.0
 
-    def _suppress_duplicate_detections(self, detections):
+    def _dedup_boxes(self, result):
+        """Remove duplicate boxes for the same physical object.
+
+        For every pair of boxes with IoU >= iou_threshold that share the same
+        class, keep only the one with the higher confidence.  This ensures
+        visualization always shows the best box per object.
         """
-        Keep one "best" bbox per heavily-overlapping same-class detections.
-        Better = higher confidence, tie-break by larger area.
-        """
-        if not detections:
-            return []
+        import torch
 
-        by_class = {}
-        for d in detections:
-            cls = d.get("class", "")
-            by_class.setdefault(cls, []).append(d)
+        try:
+            boxes = result.boxes
+            if boxes is None or len(boxes) == 0:
+                return result
 
-        kept = []
-        for cls, dets in by_class.items():
-            # Only suppress likely duplicates within same semantic class.
-            ordered = sorted(
-                dets,
-                key=lambda d: (
-                    float(d.get("conf", 0.0)),
-                    float(max(0, d["bbox_xyxy"][2] - d["bbox_xyxy"][0]) * max(0, d["bbox_xyxy"][3] - d["bbox_xyxy"][1])),
-                ),
-                reverse=True,
-            )
-            cls_kept = []
-            for det in ordered:
-                bbox = det["bbox_xyxy"]
-                is_dup = any(
-                    self._bbox_iou_xyxy(bbox, k["bbox_xyxy"]) >= self.duplicate_iou_threshold
-                    for k in cls_kept
-                )
-                if not is_dup:
-                    cls_kept.append(det)
-            kept.extend(cls_kept)
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls = boxes.cls.cpu().numpy().astype(int)
+            conf = boxes.conf.cpu().numpy()
+            n = len(xyxy)
+            if n <= 1:
+                return result
 
-        # Stable ordering for downstream behavior.
-        kept.sort(key=lambda d: (d["bbox_xyxy"][1], d["bbox_xyxy"][0], d["class"]))
-        return kept
+            keep = [True] * n
+            iou_thr = float(self.iou_threshold)
+
+            order = list(range(n))
+            order.sort(key=lambda i: -conf[i])
+
+            for idx_a in range(len(order)):
+                i = order[idx_a]
+                if not keep[i]:
+                    continue
+                for idx_b in range(idx_a + 1, len(order)):
+                    j = order[idx_b]
+                    if not keep[j]:
+                        continue
+                    if cls[i] != cls[j]:
+                        continue
+                    if self._box_iou(xyxy[i], xyxy[j]) >= iou_thr:
+                        keep[j] = False
+
+            keep_indices = [i for i in range(n) if keep[i]]
+            if len(keep_indices) == n:
+                return result
+
+            idx_tensor = torch.tensor(keep_indices, dtype=torch.long)
+            result.boxes = boxes[idx_tensor]
+            if result.masks is not None and result.masks.data is not None:
+                try:
+                    result.masks.data = result.masks.data[idx_tensor]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return result
 
     @staticmethod
     def _clamp(v, lo, hi):
@@ -426,9 +432,11 @@ class YoloRosNode:
 
         self._refresh_grid_crop_params()
         results = self._run_inference(cv_image)
-        # Draw our own filtered boxes so duplicate overlapping detections
-        # don't produce double-box visualization.
-        annotated_frame = cv_image.copy()
+        # Avoid drawing segmentation masks on the debug image if supported by this ultralytics version.
+        try:
+            annotated_frame = results[0].plot(boxes=True, masks=False)
+        except TypeError:
+            annotated_frame = results[0].plot()
 
         # Create a copy of the original image to draw dots on
         image_with_dots = cv_image.copy()
@@ -613,7 +621,6 @@ class YoloRosNode:
             boxes_conf = []
             names = {}
 
-        raw_detections = []
         for i, box in enumerate(boxes_xyxy):
             class_name = names[int(boxes_cls[i])]
             x1, y1, x2, y2 = map(int, box)
@@ -629,40 +636,18 @@ class YoloRosNode:
                 pick_x, pick_y = cx, int(y2)
 
             det = {
-                "src_idx": int(i),
                 "class": class_name,
                 "conf": conf,
                 "bbox_xyxy": [x1, y1, x2, y2],
                 "center_xy": [cx, cy],
                 "pick_xy": [int(pick_x), int(pick_y)],
             }
-            raw_detections.append(det)
+            detections.append(det)
 
-        detections = self._suppress_duplicate_detections(raw_detections)
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox_xyxy"]
-            class_name = det["class"]
-            class_id = self.name_to_id.get(class_name, 0)
-            color = self.color_map.get(class_id, (255, 255, 255))
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                annotated_frame,
-                f"{class_name} {det['conf']:.2f}",
-                (x1, max(0, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-            )
-
-        image_with_grid = annotated_frame.copy()
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox_xyxy"]
-            class_name = det["class"]
             if class_name == "workspace":
                 # Choose workspace by largest area; tie-break by confidence
                 area = float(max(0, x2 - x1) * max(0, y2 - y1))
-                score = area + float(det["conf"]) * 1e-3
+                score = area + conf * 1e-3
                 if score > workspace_score:
                     workspace_score = score
                     workspace_bbox = [x1, y1, x2, y2]
@@ -761,7 +746,6 @@ class YoloRosNode:
             mask_data = masks.data.cpu().numpy()
             height, width = cv_image.shape[:2]
             combined_mask_2d = np.zeros((height, width), dtype=np.uint8)
-            det_by_src = {int(d["src_idx"]): d for d in detections if "src_idx" in d}
 
             for i, mask in enumerate(mask_data):
                 class_name = results[0].names[int(results[0].boxes.cls[i])]
@@ -818,8 +802,7 @@ class YoloRosNode:
                 # Attach per-instance mask yaw into JSON detections (if enabled).
                 # This is purely image-based and is used by PRIME to implement ALIGN_YAW.
                 # Compute for ALL non-ignored classes (not just "object").
-                det_ref = det_by_src.get(int(i))
-                if self.compute_mask_yaw and det_ref is not None and class_name not in ("workspace", "jaco"):
+                if self.compute_mask_yaw and i < len(detections) and class_name not in ("workspace", "jaco"):
                     try:
                         ys, xs = np.nonzero(resized_mask > 0)
                         n = int(xs.size)
@@ -843,9 +826,9 @@ class YoloRosNode:
                             ev_max = float(max(1e-9, np.max(eigvals)))
                             ratio = float(ev_max / ev_min)
                             if ratio >= float(self.mask_yaw_min_ratio):
-                                det_ref["mask_center_xy"] = [int(round(x_mean)), int(round(y_mean))]
-                                det_ref["mask_yaw_rad"] = yaw
-                                det_ref["mask_yaw_ratio"] = ratio
+                                detections[i]["mask_center_xy"] = [int(round(x_mean)), int(round(y_mean))]
+                                detections[i]["mask_yaw_rad"] = yaw
+                                detections[i]["mask_yaw_ratio"] = ratio
 
                                 # Optional debug overlay: draw principal axis on the grid image.
                                 if self.draw_mask_yaw_overlay:
@@ -893,7 +876,7 @@ class YoloRosNode:
                 "grid_crop_bottom_ratio": self.grid_crop_bottom_ratio,
                 "grid_rows": 3,
                 "grid_cols": 3,
-                "detections": [{k: v for k, v in d.items() if k != "src_idx"} for d in detections],
+                "detections": detections,
             }
             self.detections_pub.publish(String(data=json.dumps(payload)))
 
