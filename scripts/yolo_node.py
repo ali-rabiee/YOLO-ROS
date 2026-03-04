@@ -57,6 +57,11 @@ class YoloRosNode:
         self.grid_crop_top_ratio = float(rospy.get_param("~grid_crop_top_ratio", 0.25))
         self.grid_crop_bottom_ratio = float(rospy.get_param("~grid_crop_bottom_ratio", 0.0))
         self._last_param_refresh = rospy.Time(0)
+        # Inference/NMS tuning (useful for suppressing duplicate boxes).
+        self.conf_threshold = float(rospy.get_param("~conf_threshold", 0.25))
+        self.iou_threshold = float(rospy.get_param("~iou_threshold", 0.45))
+        self.agnostic_nms = bool(rospy.get_param("~agnostic_nms", False))
+        self.max_det = int(rospy.get_param("~max_det", 100))
 
         # -----------------------
         # Segmentation masks
@@ -226,6 +231,46 @@ class YoloRosNode:
             self.grid_crop_top_ratio = top
             self.grid_crop_bottom_ratio = bottom
 
+        # Also allow live tuning of inference/NMS params.
+        conf = float(rospy.get_param("~conf_threshold", self.conf_threshold))
+        iou = float(rospy.get_param("~iou_threshold", self.iou_threshold))
+        agnostic = bool(rospy.get_param("~agnostic_nms", self.agnostic_nms))
+        max_det = int(rospy.get_param("~max_det", self.max_det))
+        conf = max(0.0, min(1.0, conf))
+        iou = max(0.0, min(1.0, iou))
+        max_det = max(1, max_det)
+        if (
+            abs(conf - self.conf_threshold) > 1e-6
+            or abs(iou - self.iou_threshold) > 1e-6
+            or agnostic != self.agnostic_nms
+            or max_det != self.max_det
+        ):
+            rospy.loginfo(
+                "Updated YOLO params: conf=%.2f iou=%.2f agnostic_nms=%s max_det=%d",
+                conf,
+                iou,
+                str(agnostic),
+                max_det,
+            )
+            self.conf_threshold = conf
+            self.iou_threshold = iou
+            self.agnostic_nms = agnostic
+            self.max_det = max_det
+
+    def _run_inference(self, cv_image):
+        try:
+            return self.model(
+                cv_image,
+                verbose=False,
+                conf=self.conf_threshold,
+                iou=self.iou_threshold,
+                agnostic_nms=self.agnostic_nms,
+                max_det=self.max_det,
+            )
+        except TypeError:
+            # Backward compatibility with older ultralytics versions.
+            return self.model(cv_image, verbose=False)
+
     @staticmethod
     def _clamp(v, lo, hi):
         return max(lo, min(hi, v))
@@ -314,7 +359,8 @@ class YoloRosNode:
         if cv_image is None:
             return
 
-        results = self.model(cv_image, verbose=False)
+        self._refresh_grid_crop_params()
+        results = self._run_inference(cv_image)
         # Avoid drawing segmentation masks on the debug image if supported by this ultralytics version.
         try:
             annotated_frame = results[0].plot(boxes=True, masks=False)
@@ -471,10 +517,10 @@ class YoloRosNode:
         if cv_image is None:
             return
 
-        # Allow tuning of grid crop params without restarting the node.
+        # Allow tuning of grid crop + inference params without restarting the node.
         self._refresh_grid_crop_params()
 
-        results = self.model(cv_image, verbose=False)
+        results = self._run_inference(cv_image)
         # Avoid drawing segmentation masks on the debug image if supported by this ultralytics version.
         try:
             annotated_frame = results[0].plot(boxes=True, masks=False)
